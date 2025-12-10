@@ -61,7 +61,7 @@ def get_inverter_elec(inv_id: str):
 
 
 # ----------------------------------------------------
-# PROFILS CONSOMMATION / PRODUCTION
+# PROFILS CONSOMMATION / PRODUCTION (MENSUELS / HORAIRES)
 # ----------------------------------------------------
 def monthly_pv_profile_kwh_kwp():
     """Profil mensuel PV Belgique (kWh/an/kWc)."""
@@ -124,7 +124,7 @@ def hourly_profile(profile_name: str):
 # OPTIMISATION DES STRINGS
 # ----------------------------------------------------
 def get_nominal_dc_voltage(inverter: dict) -> float:
-    """Tension DC nominale issue des fiches techniques Sigen."""
+    """Tension DC nominale typique, issue des fiches techniques ou du type réseau."""
     if "V_nom_dc" in inverter and inverter["V_nom_dc"] > 0:
         return inverter["V_nom_dc"]
 
@@ -136,7 +136,6 @@ def get_nominal_dc_voltage(inverter: dict) -> float:
     if grid == "Tri 3x400":
         return 600.0
 
-    # fallback
     return 0.5 * (inverter["Vmpp_min"] + inverter["Vmpp_max"])
 
 
@@ -151,26 +150,21 @@ def optimize_strings(
     ratio_dc_ac_max: float = 2.00,
 ):
     """
-    Optimisation automatique des strings (générique pour tous les onduleurs) :
+    Optimisation automatique des strings, valable pour tous les onduleurs :
 
-    - 0 ou 1 string par MPPT (conforme fiches Sigen).
+    - 0 ou 1 string par MPPT (conforme à la plupart des fiches Sigen).
     - Longueurs de strings éventuellement différentes sur chaque MPPT.
     - Chaque string doit vérifier :
         * Voc_froid <= Vdc_max
         * Vmp_chaud dans [Vmpp_min, Vmpp_max]
     - Le total de modules utilisés <= N_tot.
-    - Le ratio DC/AC doit être dans [ratio_dc_ac_min, ratio_dc_ac_max].
-    - La fonction renvoie la meilleure combinaison selon :
-        * Nombre de modules utilisés (max)
-        * Nombre de MPPT utilisés (max)
-        * Tension moyenne des strings proche de la tension DC nominale
-        * Ratio DC/AC proche de ratio_dc_ac_target
+    - Le ratio DC/AC dans [ratio_dc_ac_min, ratio_dc_ac_max].
     """
 
     Voc = panel["Voc"]
     Vmp = panel["Vmp"]
     Isc = panel["Isc"]
-    alpha_V = panel["alpha_V"] / 100.0  # %/°C -> 1/°C
+    alpha_V = panel["alpha_V"] / 100.0
     Pstc = panel["Pstc"]
 
     Vdc_max = inverter["Vdc_max"]
@@ -191,15 +185,11 @@ def optimize_strings(
     if Isc > Impp_max:
         return None
 
-    # Bornes sur le nombre de modules en série (même si on autorise des strings de longueur différente)
-    # - Limite par Vdc_max (Voc froid)
-    # - Limite par plage MPPT (Vmp chaud)
-    # - Minimum 3 modules pour éviter des tensions ridicules
     Vnom = get_nominal_dc_voltage(inverter)
 
-    # borne max par Voc froid
+    # Bornes sur le nombre de modules en série
     N_series_max_voc = math.floor(Vdc_max / (Voc * voc_factor_cold))
-    # borne min / max par Vmp chaud
+
     if Vmp * vmp_factor_hot > 0:
         N_series_min_vmp = math.ceil(Vmpp_min / (Vmp * vmp_factor_hot))
         N_series_max_vmp = math.floor(Vmpp_max / (Vmp * vmp_factor_hot))
@@ -216,19 +206,16 @@ def optimize_strings(
     best = None
     best_score = -1e9
 
-    # Pré-calcul des tensions pour toutes les longueurs possibles
     def vmp_hot_for(L):
         return L * Vmp * vmp_factor_hot
 
     def voc_cold_for(L):
         return L * Voc * voc_factor_cold
 
-    # Génération récursive de toutes les combinaisons de lengths par MPPT
     def search(mppt_index, remaining_modules, lengths):
         nonlocal best, best_score
 
         if mppt_index == nb_mppt:
-            # Fin : on évalue la configuration si au moins un string est utilisé
             N_used = sum(lengths)
             if N_used == 0:
                 return
@@ -241,15 +228,13 @@ def optimize_strings(
             if not (ratio_dc_ac_min <= ratio_dc_ac <= ratio_dc_ac_max):
                 return
 
-            # Score : on maximise N_used, le nombre de MPPT utilisés,
-            # et on rapproche la tension moyenne de la tension nominale
             used_lengths = [L for L in lengths if L > 0]
             n_used_mppt = len(used_lengths)
-
             if n_used_mppt == 0:
                 return
 
             vmp_mean = sum(vmp_hot_for(L) for L in used_lengths) / n_used_mppt
+
             score = (
                 1000 * N_used
                 + 100 * n_used_mppt
@@ -258,13 +243,11 @@ def optimize_strings(
             )
 
             if score > best_score:
-                # On choisit N_series_main comme la longueur la + proche de la tension nominale
                 idx_best = min(
                     range(len(used_lengths)),
                     key=lambda i: abs(vmp_hot_for(used_lengths[i]) - Vnom)
                 )
                 N_series_main = used_lengths[idx_best]
-
                 best = {
                     "strings": lengths[:],
                     "N_used": N_used,
@@ -276,21 +259,17 @@ def optimize_strings(
 
             return
 
-        # Choix de la longueur de string pour ce MPPT : 0 (non utilisé) ou L dans [N_series_min, N_series_max]
-        # avec contrainte de ne pas dépasser N_tot
-        # 0 : MPPT non utilisé
+        # MPPT non utilisé
         search(mppt_index + 1, remaining_modules, lengths + [0])
 
-        # Strings actifs
+        # MPPT avec un string actif
         for L in range(N_series_min, N_series_max + 1):
             if L > remaining_modules:
                 break
-
-            # Vérif électrique immédiate pour ce string
             if voc_cold_for(L) > Vdc_max:
                 continue
-            Vmp_hot_L = vmp_hot_for(L)
-            if not (Vmpp_min <= Vmp_hot_L <= Vmpp_max):
+            vmp_hot_L = vmp_hot_for(L)
+            if not (Vmpp_min <= vmp_hot_L <= Vmpp_max):
                 continue
 
             search(mppt_index + 1, remaining_modules - L, lengths + [L])
@@ -298,6 +277,7 @@ def optimize_strings(
     search(0, N_tot, [])
 
     return best
+
 
 # ----------------------------------------------------
 # CHOIX AUTOMATIQUE DU MEILLEUR ONDULEUR
@@ -312,24 +292,16 @@ def select_best_inverter(
     T_max: float,
 ):
     """
-    Parcourt tous les onduleurs compatibles (type réseau + famille éventuelle),
-    optimise les strings pour chacun, et choisit celui qui :
-
-    - respecte le type de réseau + famille (Store / Hybride),
-    - respecte P_dc <= P_DC_max,
-    - respecte le ratio DC/AC <= max_dc_ac (slider utilisateur, ex: 1.35),
-    - maximise la puissance DC installée.
-
-    Attention : c'est seulement pour la sélection AUTO.
-    Ensuite, lorsqu'un onduleur est choisi (auto ou manuel), on recalcule
-    les strings avec un ratio DC/AC physique plus large (0.8–2.0).
+    Sélection auto de l'onduleur :
+    - respecte type réseau + famille
+    - P_dc <= P_DC_max
+    - ratio DC/AC <= max_dc_ac (slider utilisateur, ex. 1.35)
+    - maximise P_dc
     """
     best = None
     best_score = -1e9
 
     for inv in INVERTERS:
-        # (ID, P_AC_nom, P_DC_max, V_MPP_min, V_MPP_max,
-        #  V_DC_max, I_MPPT, Nb_MPPT, Type_reseau, Famille, V_nom_dc)
         inv_id, p_ac, p_dc_max, vmin, vmax, vdcmax, imppt, nb_mppt, inv_type, inv_family, v_nom_dc = inv
 
         if inv_type != grid_type:
@@ -348,7 +320,7 @@ def select_best_inverter(
             T_min=T_min,
             T_max=T_max,
             ratio_dc_ac_min=0.8,
-            ratio_dc_ac_max=max_dc_ac,  # borne issue du slider
+            ratio_dc_ac_max=max_dc_ac,  # borne du slider pour l'AUTO
         )
         if opt is None:
             continue
@@ -356,11 +328,10 @@ def select_best_inverter(
         P_dc = opt["P_dc"]
         ratio = P_dc / p_ac
 
-        # Respect P_DC_max
         if P_dc > p_dc_max:
             continue
 
-        score = P_dc  # on maximise la puissance DC installée
+        score = P_dc
 
         if score > best_score:
             best_score = score
@@ -376,12 +347,105 @@ def select_best_inverter(
 
 
 # ----------------------------------------------------
+# SIMULATION HORAIRE (8760 H)
+# ----------------------------------------------------
+def generate_pv_profile_hourly(pv_monthly):
+    """Production PV horaire sur 8760 h à partir du profil mensuel."""
+    pv_day_profile = np.array([
+        0,0,0,0,0,
+        0.01,0.04,0.09,0.14,0.18,0.20,0.18,
+        0.14,0.10,0.06,0.03,0.01,
+        0,0,0,0,0,0,0
+    ])
+    pv_day_profile /= pv_day_profile.sum()
+
+    hours_month = [31*24, 28*24, 31*24, 30*24, 31*24, 30*24,
+                   31*24, 31*24, 30*24, 31*24, 30*24, 31*24]
+
+    pv_hourly = []
+    for m in range(12):
+        days = hours_month[m] // 24
+        prod_day = pv_monthly[m] / days if days > 0 else 0.0
+        day_profile = pv_day_profile * prod_day
+        pv_hourly.extend(list(day_profile) * days)
+
+    return np.array(pv_hourly)
+
+
+def generate_consumption_hourly(cons_monthly, cons_frac):
+    """Consommation horaire sur 8760 h à partir du profil mensuel + horaire."""
+    hours_month = [31*24, 28*24, 31*24, 30*24, 31*24, 30*24,
+                   31*24, 31*24, 30*24, 31*24, 30*24, 31*24]
+
+    cons_hourly = []
+    for m in range(12):
+        days = hours_month[m] // 24
+        cons_day = cons_monthly[m] / days if days > 0 else 0.0
+        day_profile = cons_frac * cons_day
+        cons_hourly.extend(list(day_profile) * days)
+
+    return np.array(cons_hourly)
+
+
+def simulate_battery_hourly(
+    pv_hourly,
+    cons_hourly,
+    battery_capacity_kwh,
+    charge_eff=0.95,
+    discharge_eff=0.95,
+    max_charge_power_kw=3.6,
+    max_discharge_power_kw=3.6,
+):
+    """
+    Simulation batterie sur 8760 h :
+    - SOC persistant
+    - charge / décharge avec rendement et puissance limite
+    """
+    hours = len(pv_hourly)
+    soc = 0.0
+    soc_series = np.zeros(hours)
+    ac_direct = np.zeros(hours)
+    ac_batt = np.zeros(hours)
+    grid_export = np.zeros(hours)
+    grid_import = np.zeros(hours)
+
+    for h in range(hours):
+        prod = pv_hourly[h]    # kWh
+        conso = cons_hourly[h] # kWh
+
+        direct = min(prod, conso)
+        ac_direct[h] = direct
+
+        surplus = prod - direct
+        deficit = conso - direct
+
+        max_charge_kwh = max_charge_power_kw
+        max_discharge_kwh = max_discharge_power_kw
+
+        charge_possible = min(surplus, max_charge_kwh)
+        charge_effective = charge_possible * charge_eff
+        soc = min(battery_capacity_kwh, soc + charge_effective)
+
+        discharge_possible = min(deficit, max_discharge_kwh)
+        discharge_effective = min(discharge_possible / discharge_eff, soc)
+
+        ac_batt[h] = discharge_effective * discharge_eff
+        soc -= discharge_effective
+
+        grid_export[h] = surplus - charge_possible
+        grid_import[h] = deficit - ac_batt[h]
+
+        soc_series[h] = soc
+
+    return soc_series, ac_direct, ac_batt, grid_export, grid_import
+
+
+# ----------------------------------------------------
 # SIDEBAR
 # ----------------------------------------------------
 with st.sidebar:
     st.markdown("### 🔧 Paramètres généraux")
 
-    # Sélection panneau
     panel_id = st.selectbox("Panneau", options=PANEL_IDS, index=0)
     n_modules = st.number_input("Nombre de panneaux", min_value=3, max_value=100, value=12)
 
@@ -390,10 +454,8 @@ with st.sidebar:
         st.error("Panneau introuvable dans le catalogue.")
         st.stop()
 
-    # Type réseau
     grid_type = st.selectbox("Type de réseau", options=["Mono", "Tri 3x230", "Tri 3x400"], index=0)
 
-    # Mode Store / Hybride
     sigenstore_mode = st.selectbox(
         "Installation compatible SigenStore ?",
         options=["Auto", "Oui (Store)", "Non (Hybride)"],
@@ -406,10 +468,8 @@ with st.sidebar:
     else:
         fam_pref = None
 
-    # Ratio DC/AC (pour la sélection auto uniquement)
     max_dc_ac = st.slider("Ratio DC/AC max (sélection auto)", min_value=1.0, max_value=2.0, value=1.35, step=0.01)
 
-    # Batterie
     battery_enabled = st.checkbox("Batterie", value=False)
     if battery_enabled:
         battery_kwh = st.slider("Capacité batterie (kWh)", 6.0, 50.0, 6.0, 0.5)
@@ -436,7 +496,7 @@ with st.sidebar:
     t_max = st.number_input("Température max (°C)", 30, 90, 70)
 
     st.markdown("---")
-    st.markdown("### Choix de l’onduleur")
+    st.markdown("### Choix de l’onduleur (auto ou manuel)")
 
     best = select_best_inverter(
         panel=panel_elec,
@@ -449,7 +509,7 @@ with st.sidebar:
     )
 
     if best is None:
-        st.error("Aucun onduleur compatible trouvé avec cette configuration (en sélection auto).")
+        st.error("Aucun onduleur compatible trouvé (sélection auto).")
         st.stop()
 
     auto_inv_id = best["inv_id"]
@@ -460,7 +520,6 @@ with st.sidebar:
     ]
 
     inv_options = [f"(Auto) {auto_inv_id}"] + compatible_inv
-
     selected_inv_label = st.selectbox("Onduleur", inv_options, index=0)
 
     if selected_inv_label.startswith("(Auto)"):
@@ -468,113 +527,6 @@ with st.sidebar:
     else:
         inverter_id = selected_inv_label
 
-import numpy as np
-
-def generate_pv_profile_hourly(pv_monthly):
-    """
-    Génère une production PV horaire sur 8760h à partir des productions mensuelles.
-    Profil irradiance type (normalisé) issu d'un PV moyen européen.
-    """
-    # Profil de production typique sur une journée
-    pv_day_profile = np.array([
-        0,0,0,0,0,
-        0.01,0.04,0.09,0.14,0.18,0.20,0.18,
-        0.14,0.10,0.06,0.03,0.01,
-        0,0,0,0,0,0,0
-    ])
-    pv_day_profile /= pv_day_profile.sum()
-
-    # Nombre d'heures par mois
-    hours_month = [31*24, 28*24, 31*24, 30*24, 31*24, 30*24,
-                   31*24, 31*24, 30*24, 31*24, 30*24, 31*24]
-
-    pv_hourly = []
-    for m in range(12):
-        days = hours_month[m] // 24
-        prod_day = pv_monthly[m] / days  # kWh/jour
-        day_profile = pv_day_profile * prod_day
-        pv_hourly.extend(list(day_profile) * days)
-
-    return np.array(pv_hourly)  # 8760 valeurs
-
-
-def generate_consumption_hourly(cons_monthly, cons_frac):
-    """
-    Distribue la consommation mensuelle sur un profil horaire utilisateur.
-    """
-    hours_month = [31*24, 28*24, 31*24, 30*24, 31*24, 30*24,
-                   31*24, 31*24, 30*24, 31*24, 30*24, 31*24]
-
-    cons_hourly = []
-    for m in range(12):
-        days = hours_month[m] // 24
-        cons_day = cons_monthly[m] / days
-        day_profile = cons_frac * cons_day
-        cons_hourly.extend(list(day_profile) * days)
-
-    return np.array(cons_hourly)  # 8760 valeurs
-
-
-def simulate_battery_hourly(
-    pv_hourly,
-    cons_hourly,
-    battery_capacity_kwh,
-    charge_eff=0.95,
-    discharge_eff=0.95,
-    max_charge_power_kw=3.6,   # 16A × 230 V typique
-    max_discharge_power_kw=3.6
-):
-    """
-    Simulation physique précise :
-    - 8760 heures
-    - SOC persistant
-    - charge/décharge limitées en puissance
-    - rendement charge/décharge
-    """
-
-    hours = len(pv_hourly)
-    soc = 0.0
-    soc_series = np.zeros(hours)
-    ac_direct = np.zeros(hours)
-    ac_batt = np.zeros(hours)
-    grid_export = np.zeros(hours)
-    grid_import = np.zeros(hours)
-
-    for h in range(hours):
-
-        prod = pv_hourly[h]   # kWh
-        conso = cons_hourly[h]  # kWh
-
-        # Autoconsommation directe
-        direct = min(prod, conso)
-        ac_direct[h] = direct
-
-        surplus = prod - direct
-        deficit = conso - direct
-
-        # Puissance max charge/décharge → conversion en énergie horaire
-        max_charge_kwh = max_charge_power_kw  # sur 1h
-        max_discharge_kwh = max_discharge_power_kw  # sur 1h
-
-        # Charge batterie
-        charge_possible = min(surplus, max_charge_kwh)
-        charge_effective = charge_possible * charge_eff
-        soc = min(battery_capacity_kwh, soc + charge_effective)
-
-        # Décharge batterie
-        discharge_possible = min(deficit, max_discharge_kwh)
-        discharge_effective = min(discharge_possible / discharge_eff, soc)
-
-        ac_batt[h] = discharge_effective * discharge_eff
-        soc -= discharge_effective
-
-        # Flux réseau
-        grid_export[h] = surplus - charge_possible
-        grid_import[h] = deficit - ac_batt[h]
-
-        soc_series[h] = soc
-
-    return soc_series, ac_direct, ac_batt, grid_export, grid_import
 
 # ----------------------------------------------------
 # CALCULS PRINCIPAUX
@@ -584,7 +536,7 @@ if inv_elec is None:
     st.error("Spécifications onduleur introuvables.")
     st.stop()
 
-# Ici, on NE LIMITE PLUS par le slider utilisateur, mais par la physique (ratio <= 2.0)
+# Optimisation de strings pour l'onduleur choisi (physique, ratio jusqu'à 2.0)
 opt_result = optimize_strings(
     N_tot=int(n_modules),
     panel=panel_elec,
@@ -592,9 +544,8 @@ opt_result = optimize_strings(
     T_min=float(t_min),
     T_max=float(t_max),
     ratio_dc_ac_min=0.8,
-    ratio_dc_ac_max=2.0,  # borne physique, indépendante du slider
+    ratio_dc_ac_max=2.0,
 )
-
 
 if opt_result is None:
     st.error(
@@ -607,35 +558,33 @@ P_dc = opt_result["P_dc"]
 ratio_dc_ac = opt_result["ratio_dc_ac"]
 p_dc_kwp = P_dc / 1000.0
 
-# Profils mensuels
+# Profil mensuel PV et conso
 pv_kwh_per_kwp = monthly_pv_profile_kwh_kwp()
 pv_monthly = pv_kwh_per_kwp * p_dc_kwp
-
 cons_monthly = monthly_consumption_profile(annual_consumption, consumption_profile)
 
-# ----------------------------------------------------
-# SIMULATION HORAIRE COMPLETE (PV + conso + batterie)
-# ----------------------------------------------------
+months_labels = ["Jan", "Fév", "Mar", "Avr", "Mai", "Juin",
+                 "Juil", "Août", "Sep", "Oct", "Nov", "Déc"]
+hours_per_month = [31*24, 28*24, 31*24, 30*24, 31*24, 30*24,
+                   31*24, 31*24, 30*24, 31*24, 30*24, 31*24]
 
-# Profil consommation horaire (normalisé)
+# ----------------------------------------------------
+# SIMULATION HORAIRE COMPLETE
+# ----------------------------------------------------
 cons_frac = hourly_profile(hourly_profile_choice)
 
-# 1. Génération PV horaire (8760h)
 pv_hourly = generate_pv_profile_hourly(pv_monthly)
-
-# 2. Génération consommation horaire (8760h)
 cons_hourly = generate_consumption_hourly(cons_monthly, cons_frac)
 
-# 3. Simulation batterie
 if battery_enabled and battery_kwh > 0:
     soc, ac_direct_h, ac_batt_h, export_h, import_h = simulate_battery_hourly(
         pv_hourly,
         cons_hourly,
-        battery_capacity_kwh=battery_kwh,
+        battery_capacity_kwh=float(battery_kwh),
         charge_eff=0.95,
         discharge_eff=0.95,
         max_charge_power_kw=3.6,
-        max_discharge_power_kw=3.6
+        max_discharge_power_kw=3.6,
     )
 else:
     soc = np.zeros_like(pv_hourly)
@@ -644,18 +593,39 @@ else:
     export_h = pv_hourly - ac_direct_h
     import_h = cons_hourly - ac_direct_h
 
-# Agrégation annuelle
+# Agrégation mensuelle depuis 8760 h
+pv_monthly_sim = []
+cons_monthly_sim = []
+ac_direct_monthly = []
+ac_batt_monthly = []
+
+start = 0
+for hm in hours_per_month:
+    end = start + hm
+    pv_monthly_sim.append(pv_hourly[start:end].sum())
+    cons_monthly_sim.append(cons_hourly[start:end].sum())
+    ac_direct_monthly.append(ac_direct_h[start:end].sum())
+    ac_batt_monthly.append(ac_batt_h[start:end].sum())
+    start = end
+
+pv_monthly_sim = np.array(pv_monthly_sim)
+cons_monthly_sim = np.array(cons_monthly_sim)
+ac_direct_monthly = np.array(ac_direct_monthly)
+ac_batt_monthly = np.array(ac_batt_monthly)
+ac_total_monthly = ac_direct_monthly + ac_batt_monthly
+
+# Énergie annuelle
 pv_year = pv_hourly.sum()
 cons_year = cons_hourly.sum()
 ac_direct_year = ac_direct_h.sum()
 ac_batt_year = ac_batt_h.sum()
 ac_total_year = ac_direct_year + ac_batt_year
 
-# Garantir AC ≤ PV
-ac_total_year = min(ac_total_year, pv_year)
+# Garantir AC ≤ PV et ≤ conso
+ac_total_year = min(ac_total_year, pv_year, cons_year)
 
-taux_auto = ac_total_year / pv_year * 100
-taux_couv = ac_total_year / cons_year * 100
+taux_auto = (ac_total_year / pv_year * 100) if pv_year > 0 else 0.0
+taux_couv = (ac_total_year / cons_year * 100) if cons_year > 0 else 0.0
 
 # ----------------------------------------------------
 # EN-TÊTE / METRICS
@@ -686,9 +656,8 @@ with col4:
     st.metric("Onduleur choisi", inverter_id)
     st.metric("Ratio DC/AC réel", f"{ratio_dc_ac:.2f}")
     if battery_enabled and battery_kwh > 0:
-        st.metric("Autocons. via batterie", f"{autocons_year_batt:.0f} kWh")
+        st.metric("Autocons. via batterie", f"{ac_batt_year:.0f} kWh")
 
-# Avertissement si le ratio dépasse le souhait utilisateur
 if ratio_dc_ac > float(max_dc_ac):
     st.warning(
         f"Le câblage retenu a un ratio DC/AC de {ratio_dc_ac:.2f}, "
@@ -727,11 +696,11 @@ st.markdown("## 📊 Production vs Consommation – Profil mensuel")
 
 df_month = pd.DataFrame({
     "Mois": months_labels,
-    "Consommation (kWh)": cons_monthly,
-    "Production PV (kWh)": pv_monthly,
-    "Autocons. directe (kWh)": autocons_monthly_direct,
-    "Autocons. batterie (kWh)": autocons_batt_monthly,
-    "Autocons. totale (kWh)": autocons_monthly_total,
+    "Consommation (kWh)": cons_monthly_sim,
+    "Production PV (kWh)": pv_monthly_sim,
+    "Autocons. directe (kWh)": ac_direct_monthly,
+    "Autocons. batterie (kWh)": ac_batt_monthly,
+    "Autocons. totale (kWh)": ac_total_monthly,
 })
 
 fig = px.bar(
@@ -745,31 +714,35 @@ st.plotly_chart(fig, use_container_width=True)
 st.dataframe(df_month)
 
 # ----------------------------------------------------
-# PROFIL HORAIRE – JOUR TYPE
+# PROFIL HORAIRE – JOUR TYPE (MOYEN SUR LE MOIS CHOISI)
 # ----------------------------------------------------
-st.markdown("## 🕒 Profil horaire – jour type")
+st.markdown("## 🕒 Profil horaire – jour type (moyenne sur le mois)")
 
 idx = month_for_hours - 1
+start_h = sum(hours_per_month[:idx])
+end_h = start_h + hours_per_month[idx]
+days_sel = hours_per_month[idx] // 24
 
-day_cons = cons_monthly[idx] / days_in_month[idx]
-day_pv = pv_monthly[idx] / days_in_month[idx]
+pv_block = pv_hourly[start_h:end_h].reshape((days_sel, 24))
+cons_block = cons_hourly[start_h:end_h].reshape((days_sel, 24))
+ac_dir_block = ac_direct_h[start_h:end_h].reshape((days_sel, 24))
+ac_batt_block = ac_batt_h[start_h:end_h].reshape((days_sel, 24))
 
-cons_hour = day_cons * cons_frac
-pv_hour = day_pv * pv_frac
-
-autocons_hour_direct = np.minimum(cons_hour, pv_hour)
+pv_day = pv_block.mean(axis=0)
+cons_day = cons_block.mean(axis=0)
+ac_total_day = (ac_dir_block + ac_batt_block).mean(axis=0)
 
 df_hour = pd.DataFrame({
     "Heure": np.arange(24),
-    "Consommation (kWh)": cons_hour,
-    "Production PV (kWh)": pv_hour,
-    "Autocons. directe (kWh)": autocons_hour_direct,
+    "Consommation (kWh)": cons_day,
+    "Production PV (kWh)": pv_day,
+    "Autoconsommation (kWh)": ac_total_day,
 })
 
 fig2 = px.line(
     df_hour,
     x="Heure",
-    y=["Consommation (kWh)", "Production PV (kWh)", "Autocons. directe (kWh)"],
+    y=["Consommation (kWh)", "Production PV (kWh)", "Autoconsommation (kWh)"],
     markers=True,
     labels={"value": "kWh", "variable": ""},
 )
