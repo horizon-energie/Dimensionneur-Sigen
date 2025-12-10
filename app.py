@@ -685,7 +685,7 @@ with col3:
 with col4:
     st.metric("Onduleur choisi", inverter_id)
     st.metric("Ratio DC/AC réel", f"{ratio_dc_ac:.2f}")
-    if battery_capacity > 0:
+    if battery_capacity_kwh > 0:
         st.metric("Autocons. via batterie", f"{autocons_year_batt:.0f} kWh")
 
 # Avertissement si le ratio dépasse le souhait utilisateur
