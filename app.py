@@ -147,20 +147,30 @@ def optimize_strings(
     T_min: float,
     T_max: float,
     ratio_dc_ac_target: float = 1.35,
-    ratio_dc_ac_min: float = 1.00,
+    ratio_dc_ac_min: float = 0.80,
     ratio_dc_ac_max: float = 2.00,
 ):
     """
-    Optimisation automatique des strings :
-    - calcule une répartition par MPPT (1 string max par MPPT)
-    - strings éventuellement de longueurs différentes
-    - au moins un MPPT proche de la tension nominale DC
-    - respect des contraintes Voc froid, Vmp chaud, courant MPPT et ratio DC/AC.
+    Optimisation automatique des strings (générique pour tous les onduleurs) :
+
+    - 0 ou 1 string par MPPT (conforme fiches Sigen).
+    - Longueurs de strings éventuellement différentes sur chaque MPPT.
+    - Chaque string doit vérifier :
+        * Voc_froid <= Vdc_max
+        * Vmp_chaud dans [Vmpp_min, Vmpp_max]
+    - Le total de modules utilisés <= N_tot.
+    - Le ratio DC/AC doit être dans [ratio_dc_ac_min, ratio_dc_ac_max].
+    - La fonction renvoie la meilleure combinaison selon :
+        * Nombre de modules utilisés (max)
+        * Nombre de MPPT utilisés (max)
+        * Tension moyenne des strings proche de la tension DC nominale
+        * Ratio DC/AC proche de ratio_dc_ac_target
     """
+
     Voc = panel["Voc"]
     Vmp = panel["Vmp"]
     Isc = panel["Isc"]
-    alpha_V = panel["alpha_V"] / 100.0
+    alpha_V = panel["alpha_V"] / 100.0  # %/°C -> 1/°C
     Pstc = panel["Pstc"]
 
     Vdc_max = inverter["Vdc_max"]
@@ -169,6 +179,7 @@ def optimize_strings(
     Impp_max = inverter["Impp_max"]
     nb_mppt = inverter["nb_mppt"]
     P_ac = inverter["P_ac"]
+    P_dc_max = inverter.get("P_dc_max", 1e9)
 
     voc_factor_cold = (1 + alpha_V * (T_min - 25.0))
     vmp_factor_hot = (1 + alpha_V * (T_max - 25.0))
@@ -176,113 +187,117 @@ def optimize_strings(
     if voc_factor_cold <= 0 or vmp_factor_hot <= 0:
         return None
 
+    # Courant : 1 string par MPPT => courant = Isc
+    if Isc > Impp_max:
+        return None
+
+    # Bornes sur le nombre de modules en série (même si on autorise des strings de longueur différente)
+    # - Limite par Vdc_max (Voc froid)
+    # - Limite par plage MPPT (Vmp chaud)
+    # - Minimum 3 modules pour éviter des tensions ridicules
     Vnom = get_nominal_dc_voltage(inverter)
 
-    # Bornes sur le nombre de modules en série
-    N_series_max = math.floor(Vdc_max / (Voc * voc_factor_cold))
-    N_series_min = 3
+    # borne max par Voc froid
+    N_series_max_voc = math.floor(Vdc_max / (Voc * voc_factor_cold))
+    # borne min / max par Vmp chaud
+    if Vmp * vmp_factor_hot > 0:
+        N_series_min_vmp = math.ceil(Vmpp_min / (Vmp * vmp_factor_hot))
+        N_series_max_vmp = math.floor(Vmpp_max / (Vmp * vmp_factor_hot))
+    else:
+        N_series_min_vmp = 1
+        N_series_max_vmp = N_series_max_voc
+
+    N_series_min = max(3, N_series_min_vmp)
+    N_series_max = min(N_series_max_voc, N_series_max_vmp)
 
     if N_series_min > N_series_max:
         return None
 
-    # Nombre de modules idéal sur le string "principal"
-    if Vnom > 0:
-        N_series_ideal = max(
-            N_series_min,
-            min(N_series_max, int(round(Vnom / (Vmp * vmp_factor_hot))))
-        )
-    else:
-        N_series_ideal = N_series_min
-
     best = None
     best_score = -1e9
 
-    # On teste tous les N_series possibles
-    for N_series_main in range(N_series_min, N_series_max + 1):
-        # Vérif électrique de ce string "principal"
-        Voc_cold_main = N_series_main * Voc * voc_factor_cold
-        Vmp_hot_main = N_series_main * Vmp * vmp_factor_hot
+    # Pré-calcul des tensions pour toutes les longueurs possibles
+    def vmp_hot_for(L):
+        return L * Vmp * vmp_factor_hot
 
-        if Voc_cold_main > Vdc_max:
-            continue
-        if not (Vmpp_min <= Vmp_hot_main <= Vmpp_max):
-            continue
+    def voc_cold_for(L):
+        return L * Voc * voc_factor_cold
 
-        # Maximum de strings de cette taille
-        max_full_strings = N_tot // N_series_main
-        if max_full_strings == 0:
-            continue
+    # Génération récursive de toutes les combinaisons de lengths par MPPT
+    def search(mppt_index, remaining_modules, lengths):
+        nonlocal best, best_score
 
-        # 1 string par MPPT
-        max_full_strings = min(max_full_strings, nb_mppt)
+        if mppt_index == nb_mppt:
+            # Fin : on évalue la configuration si au moins un string est utilisé
+            N_used = sum(lengths)
+            if N_used == 0:
+                return
 
-        for n_full in range(1, max_full_strings + 1):
-            used_full = n_full * N_series_main
-            remaining = N_tot - used_full
+            P_dc = N_used * Pstc
+            if P_dc > P_dc_max:
+                return
 
-            # Cas 1 : aucun reste exploitable
-            possible_remainders = [0]
+            ratio_dc_ac = P_dc / P_ac
+            if not (ratio_dc_ac_min <= ratio_dc_ac <= ratio_dc_ac_max):
+                return
 
-            # Cas 2 : un string "reste" sur un MPPT libre si suffisamment de modules
-            if remaining >= N_series_min and n_full < nb_mppt:
-                possible_remainders.append(remaining)
+            # Score : on maximise N_used, le nombre de MPPT utilisés,
+            # et on rapproche la tension moyenne de la tension nominale
+            used_lengths = [L for L in lengths if L > 0]
+            n_used_mppt = len(used_lengths)
 
-            for rem in possible_remainders:
-                strings_sizes = []
+            if n_used_mppt == 0:
+                return
 
-                # On met éventuellement le string "reste" en premier MPPT
-                if rem > 0:
-                    Voc_cold_rem = rem * Voc * voc_factor_cold
-                    Vmp_hot_rem = rem * Vmp * vmp_factor_hot
-                    if Voc_cold_rem > Vdc_max:
-                        continue
-                    if not (Vmpp_min <= Vmp_hot_rem <= Vmpp_max):
-                        continue
+            vmp_mean = sum(vmp_hot_for(L) for L in used_lengths) / n_used_mppt
+            score = (
+                1000 * N_used
+                + 100 * n_used_mppt
+                - 2.0 * abs(vmp_mean - Vnom)
+                - 50.0 * abs(ratio_dc_ac - ratio_dc_ac_target)
+            )
 
-                    strings_sizes.append(rem)
-
-                # Puis les strings "principaux"
-                for _ in range(n_full):
-                    strings_sizes.append(N_series_main)
-
-                # Complète les MPPT inutilisés
-                while len(strings_sizes) < nb_mppt:
-                    strings_sizes.append(0)
-
-                # Vérif courant par MPPT (1 string max par MPPT)
-                if Isc > Impp_max:
-                    continue
-
-                N_used = sum(strings_sizes)
-                P_dc = N_used * Pstc
-                ratio_dc_ac = P_dc / P_ac
-
-                if ratio_dc_ac < ratio_dc_ac_min or ratio_dc_ac > ratio_dc_ac_max:
-                    continue
-
-                # Score :
-                # - max modules utilisés
-                # - max MPPT utilisés
-                # - string principal proche de N_series_ideal
-                score = (
-                    1000 * N_used
-                    + 200 * sum(1 for s in strings_sizes if s > 0)
-                    - 50 * abs(N_series_main - N_series_ideal)
-                    - 10 * abs(ratio_dc_ac - ratio_dc_ac_target)
+            if score > best_score:
+                # On choisit N_series_main comme la longueur la + proche de la tension nominale
+                idx_best = min(
+                    range(len(used_lengths)),
+                    key=lambda i: abs(vmp_hot_for(used_lengths[i]) - Vnom)
                 )
+                N_series_main = used_lengths[idx_best]
 
-                if score > best_score:
-                    best_score = score
-                    best = {
-                        "strings": strings_sizes,       # liste de taille nb_mppt
-                        "N_used": N_used,
-                        "N_series_main": N_series_main,
-                        "P_dc": P_dc,
-                        "ratio_dc_ac": ratio_dc_ac,
-                    }
+                best = {
+                    "strings": lengths[:],
+                    "N_used": N_used,
+                    "N_series_main": N_series_main,
+                    "P_dc": P_dc,
+                    "ratio_dc_ac": ratio_dc_ac,
+                }
+                best_score = score
+
+            return
+
+        # Choix de la longueur de string pour ce MPPT : 0 (non utilisé) ou L dans [N_series_min, N_series_max]
+        # avec contrainte de ne pas dépasser N_tot
+        # 0 : MPPT non utilisé
+        search(mppt_index + 1, remaining_modules, lengths + [0])
+
+        # Strings actifs
+        for L in range(N_series_min, N_series_max + 1):
+            if L > remaining_modules:
+                break
+
+            # Vérif électrique immédiate pour ce string
+            if voc_cold_for(L) > Vdc_max:
+                continue
+            Vmp_hot_L = vmp_hot_for(L)
+            if not (Vmpp_min <= Vmp_hot_L <= Vmpp_max):
+                continue
+
+            search(mppt_index + 1, remaining_modules - L, lengths + [L])
+
+    search(0, N_tot, [])
 
     return best
-
 
 # ----------------------------------------------------
 # CHOIX AUTOMATIQUE DU MEILLEUR ONDULEUR
@@ -299,10 +314,15 @@ def select_best_inverter(
     """
     Parcourt tous les onduleurs compatibles (type réseau + famille éventuelle),
     optimise les strings pour chacun, et choisit celui qui :
-    - respecte les contraintes
-    - respecte le ratio DC/AC <= max_dc_ac (slider utilisateur)
-    - respecte P_dc <= P_DC_max
-    - maximise la puissance DC installée
+
+    - respecte le type de réseau + famille (Store / Hybride),
+    - respecte P_dc <= P_DC_max,
+    - respecte le ratio DC/AC <= max_dc_ac (slider utilisateur, ex: 1.35),
+    - maximise la puissance DC installée.
+
+    Attention : c'est seulement pour la sélection AUTO.
+    Ensuite, lorsqu'un onduleur est choisi (auto ou manuel), on recalcule
+    les strings avec un ratio DC/AC physique plus large (0.8–2.0).
     """
     best = None
     best_score = -1e9
@@ -321,15 +341,14 @@ def select_best_inverter(
         if inv_elec is None:
             continue
 
-        # On limite par le slider ici (choix auto)
         opt = optimize_strings(
             N_tot=n_panels,
             panel=panel,
             inverter=inv_elec,
             T_min=T_min,
             T_max=T_max,
-            ratio_dc_ac_min=1.0,
-            ratio_dc_ac_max=max_dc_ac,
+            ratio_dc_ac_min=0.8,
+            ratio_dc_ac_max=max_dc_ac,  # borne issue du slider
         )
         if opt is None:
             continue
@@ -465,9 +484,10 @@ opt_result = optimize_strings(
     inverter=inv_elec,
     T_min=float(t_min),
     T_max=float(t_max),
-    ratio_dc_ac_min=1.0,
-    ratio_dc_ac_max=2.0,
+    ratio_dc_ac_min=0.8,
+    ratio_dc_ac_max=2.0,  # borne physique, indépendante du slider
 )
+
 
 if opt_result is None:
     st.error(
