@@ -468,6 +468,113 @@ with st.sidebar:
     else:
         inverter_id = selected_inv_label
 
+import numpy as np
+
+def generate_pv_profile_hourly(pv_monthly):
+    """
+    Génère une production PV horaire sur 8760h à partir des productions mensuelles.
+    Profil irradiance type (normalisé) issu d'un PV moyen européen.
+    """
+    # Profil de production typique sur une journée
+    pv_day_profile = np.array([
+        0,0,0,0,0,
+        0.01,0.04,0.09,0.14,0.18,0.20,0.18,
+        0.14,0.10,0.06,0.03,0.01,
+        0,0,0,0,0,0,0
+    ])
+    pv_day_profile /= pv_day_profile.sum()
+
+    # Nombre d'heures par mois
+    hours_month = [31*24, 28*24, 31*24, 30*24, 31*24, 30*24,
+                   31*24, 31*24, 30*24, 31*24, 30*24, 31*24]
+
+    pv_hourly = []
+    for m in range(12):
+        days = hours_month[m] // 24
+        prod_day = pv_monthly[m] / days  # kWh/jour
+        day_profile = pv_day_profile * prod_day
+        pv_hourly.extend(list(day_profile) * days)
+
+    return np.array(pv_hourly)  # 8760 valeurs
+
+
+def generate_consumption_hourly(cons_monthly, cons_frac):
+    """
+    Distribue la consommation mensuelle sur un profil horaire utilisateur.
+    """
+    hours_month = [31*24, 28*24, 31*24, 30*24, 31*24, 30*24,
+                   31*24, 31*24, 30*24, 31*24, 30*24, 31*24]
+
+    cons_hourly = []
+    for m in range(12):
+        days = hours_month[m] // 24
+        cons_day = cons_monthly[m] / days
+        day_profile = cons_frac * cons_day
+        cons_hourly.extend(list(day_profile) * days)
+
+    return np.array(cons_hourly)  # 8760 valeurs
+
+
+def simulate_battery_hourly(
+    pv_hourly,
+    cons_hourly,
+    battery_capacity_kwh,
+    charge_eff=0.95,
+    discharge_eff=0.95,
+    max_charge_power_kw=3.6,   # 16A × 230 V typique
+    max_discharge_power_kw=3.6
+):
+    """
+    Simulation physique précise :
+    - 8760 heures
+    - SOC persistant
+    - charge/décharge limitées en puissance
+    - rendement charge/décharge
+    """
+
+    hours = len(pv_hourly)
+    soc = 0.0
+    soc_series = np.zeros(hours)
+    ac_direct = np.zeros(hours)
+    ac_batt = np.zeros(hours)
+    grid_export = np.zeros(hours)
+    grid_import = np.zeros(hours)
+
+    for h in range(hours):
+
+        prod = pv_hourly[h]   # kWh
+        conso = cons_hourly[h]  # kWh
+
+        # Autoconsommation directe
+        direct = min(prod, conso)
+        ac_direct[h] = direct
+
+        surplus = prod - direct
+        deficit = conso - direct
+
+        # Puissance max charge/décharge → conversion en énergie horaire
+        max_charge_kwh = max_charge_power_kw  # sur 1h
+        max_discharge_kwh = max_discharge_power_kw  # sur 1h
+
+        # Charge batterie
+        charge_possible = min(surplus, max_charge_kwh)
+        charge_effective = charge_possible * charge_eff
+        soc = min(battery_capacity_kwh, soc + charge_effective)
+
+        # Décharge batterie
+        discharge_possible = min(deficit, max_discharge_kwh)
+        discharge_effective = min(discharge_possible / discharge_eff, soc)
+
+        ac_batt[h] = discharge_effective * discharge_eff
+        soc -= discharge_effective
+
+        # Flux réseau
+        grid_export[h] = surplus - charge_possible
+        grid_import[h] = deficit - ac_batt[h]
+
+        soc_series[h] = soc
+
+    return soc_series, ac_direct, ac_batt, grid_export, grid_import
 
 # ----------------------------------------------------
 # CALCULS PRINCIPAUX
@@ -506,82 +613,49 @@ pv_monthly = pv_kwh_per_kwp * p_dc_kwp
 
 cons_monthly = monthly_consumption_profile(annual_consumption, consumption_profile)
 
-# Autoconsommation directe (sans batterie) au niveau mensuel
-autocons_monthly_direct = np.minimum(pv_monthly, cons_monthly)
+# ----------------------------------------------------
+# SIMULATION HORAIRE COMPLETE (PV + conso + batterie)
+# ----------------------------------------------------
 
-months_labels = ["Jan", "Fév", "Mar", "Avr", "Mai", "Juin",
-                 "Juil", "Août", "Sep", "Oct", "Nov", "Déc"]
-
-days_in_month = np.array([31, 28, 31, 30, 31, 30, 31, 31, 30, 31, 30, 31])
-
-# Profil horaire de consommation (normalisé)
+# Profil consommation horaire (normalisé)
 cons_frac = hourly_profile(hourly_profile_choice)
 
-# Profil horaire de production PV type (normalisé)
-pv_frac = np.array([
-    0, 0, 0, 0, 0,
-    0.01, 0.04, 0.07, 0.10, 0.13, 0.14, 0.14,
-    0.13, 0.10, 0.07, 0.04, 0.02,
-    0, 0, 0, 0, 0, 0, 0,
-])
-if pv_frac.sum() > 0:
-    pv_frac = pv_frac / pv_frac.sum()
+# 1. Génération PV horaire (8760h)
+pv_hourly = generate_pv_profile_hourly(pv_monthly)
 
-# ----------------------------------------------------
-# MODÈLE SIMPLE DE BATTERIE (SOC persistant dans le mois)
-# ----------------------------------------------------
-battery_capacity = float(battery_kwh)  # kWh
-autocons_batt_monthly = np.zeros(12)
+# 2. Génération consommation horaire (8760h)
+cons_hourly = generate_consumption_hourly(cons_monthly, cons_frac)
 
-if battery_capacity > 0:
-    for m in range(12):
-        days = int(days_in_month[m])
-        if days <= 0:
-            continue
+# 3. Simulation batterie
+if battery_enabled and battery_kwh > 0:
+    soc, ac_direct_h, ac_batt_h, export_h, import_h = simulate_battery_hourly(
+        pv_hourly,
+        cons_hourly,
+        battery_capacity_kwh=battery_kwh,
+        charge_eff=0.95,
+        discharge_eff=0.95,
+        max_charge_power_kw=3.6,
+        max_discharge_power_kw=3.6
+    )
+else:
+    soc = np.zeros_like(pv_hourly)
+    ac_direct_h = np.minimum(pv_hourly, cons_hourly)
+    ac_batt_h = np.zeros_like(pv_hourly)
+    export_h = pv_hourly - ac_direct_h
+    import_h = cons_hourly - ac_direct_h
 
-        pv_day = pv_monthly[m] / days
-        cons_day = cons_monthly[m] / days
+# Agrégation annuelle
+pv_year = pv_hourly.sum()
+cons_year = cons_hourly.sum()
+ac_direct_year = ac_direct_h.sum()
+ac_batt_year = ac_batt_h.sum()
+ac_total_year = ac_direct_year + ac_batt_year
 
-        pv_h = pv_frac * pv_day
-        cons_h = cons_frac * cons_day
+# Garantir AC ≤ PV
+ac_total_year = min(ac_total_year, pv_year)
 
-        autocons_batt = 0.0
-
-        # SOC persistant sur le mois
-        battery_soc = 0.0
-
-        for _ in range(days):
-
-            for h in range(24):
-                prod = pv_h[h]
-                conso = cons_h[h]
-
-                direct = min(prod, conso)
-                surplus = prod - direct
-                deficit = conso - direct
-
-                # Charge batterie
-                battery_soc = min(battery_soc + surplus, battery_capacity)
-
-                # Décharge batterie
-                discharge = min(deficit, battery_soc)
-                battery_soc -= discharge
-
-                autocons_batt += discharge
-
-        autocons_batt_monthly[m] = autocons_batt
-
-# Autocons totale
-autocons_monthly_total = autocons_monthly_direct + autocons_batt_monthly
-
-pv_year = float(pv_monthly.sum())
-cons_year = float(annual_consumption)
-autocons_year_direct = float(autocons_monthly_direct.sum())
-autocons_year_batt = float(autocons_batt_monthly.sum())
-autocons_year = autocons_year_direct + autocons_year_batt
-
-taux_auto = (autocons_year / pv_year * 100) if pv_year > 0 else 0.0
-taux_couv = (autocons_year / cons_year * 100) if cons_year > 0 else 0.0
+taux_auto = ac_total_year / pv_year * 100
+taux_couv = ac_total_year / cons_year * 100
 
 # ----------------------------------------------------
 # EN-TÊTE / METRICS
