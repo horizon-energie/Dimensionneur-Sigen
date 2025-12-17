@@ -650,7 +650,7 @@ with col2:
 
 with col3:
     st.metric("Taux autocons. total", f"{taux_auto:.1f} %")
-    st.metric("Taux couverture", f"{taux_couv:.1f} %")
+    #st.metric("Taux couverture", f"{taux_couv:.1f} %")
 
 with col4:
     st.metric("Onduleur choisi", inverter_id)
